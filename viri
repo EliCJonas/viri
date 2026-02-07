@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_BASE = "https://www.virustotal.com/api/v3"
+
+
+def load_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+def api_get(api_key, endpoint):
+    req = urllib.request.Request(
+        f"{API_BASE}{endpoint}",
+        headers={"x-apikey": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        msg = body.get("error", {}).get("message", str(e))
+        print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+
+def api_post(api_key, endpoint, data=None, files=None):
+    if files:
+        boundary = "----ViriBoundary"
+        body = b""
+        for field, (filename, filedata) in files.items():
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'.encode()
+            body += b"Content-Type: application/octet-stream\r\n\r\n"
+            body += filedata + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        content_type = f"multipart/form-data; boundary={boundary}"
+    else:
+        body = urllib.parse.urlencode(data or {}).encode()
+        content_type = "application/x-www-form-urlencoded"
+
+    req = urllib.request.Request(
+        f"{API_BASE}{endpoint}",
+        data=body,
+        headers={
+            "x-apikey": api_key,
+            "Content-Type": content_type,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = json.loads(e.read())
+        msg = error_body.get("error", {}).get("message", str(e))
+        print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+
+def scan_hash(api_key, file_hash):
+    result = api_get(api_key, f"/files/{file_hash}")
+    attrs = result["data"]["attributes"]
+    print(f"Name:  {attrs.get('meaningful_name', 'N/A')}")
+    print("Stats:")
+    for k, v in attrs.get("last_analysis_stats", {}).items():
+        print(f"  {k}: {v}")
+
+
+def upload_file(api_key, path):
+    if not os.path.isfile(path):
+        print(f"Error: {path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(path, "rb") as f:
+        file_data = f.read()
+
+    result = api_post(api_key, "/files", files={
+        "file": (os.path.basename(path), file_data),
+    })
+    analysis_id = result["data"]["id"]
+    print(f"Analysis ID: {analysis_id}")
+    print("Waiting for analysis to complete...")
+
+    while True:
+        analysis = api_get(api_key, f"/analyses/{analysis_id}")
+        if analysis["data"]["attributes"]["status"] == "completed":
+            break
+        time.sleep(5)
+
+    print("Stats:")
+    for k, v in analysis["data"]["attributes"].get("stats", {}).items():
+        print(f"  {k}: {v}")
+
+
+def scan_url(api_key, url):
+    url_id = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    result = api_get(api_key, f"/urls/{url_id}")
+
+    if result:
+        attrs = result["data"]["attributes"]
+        print(f"URL:   {attrs.get('url', url)}")
+        print("Stats:")
+        for k, v in attrs.get("last_analysis_stats", {}).items():
+            print(f"  {k}: {v}")
+
+
+def submit_url(api_key, url):
+    print("URL not found in VirusTotal, submitting for scan...")
+    result = api_post(api_key, "/urls", data={"url": url})
+    analysis_id = result["data"]["id"]
+
+    while True:
+        analysis = api_get(api_key, f"/analyses/{analysis_id}")
+        if analysis["data"]["attributes"]["status"] == "completed":
+            break
+        time.sleep(5)
+
+    print(f"URL:   {url}")
+    print("Stats:")
+    for k, v in analysis["data"]["attributes"].get("stats", {}).items():
+        print(f"  {k}: {v}")
+
+
+def scan_url_cmd(api_key, url):
+    url_id = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+
+    req = urllib.request.Request(
+        f"{API_BASE}/urls/{url_id}",
+        headers={"x-apikey": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+        attrs = result["data"]["attributes"]
+        print(f"URL:   {attrs.get('url', url)}")
+        print("Stats:")
+        for k, v in attrs.get("last_analysis_stats", {}).items():
+            print(f"  {k}: {v}")
+    except urllib.error.HTTPError:
+        submit_url(api_key, url)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VirusTotal CLI scanner")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    hash_cmd = subparsers.add_parser("hash", help="Look up a file hash")
+    hash_cmd.add_argument("hash", help="MD5, SHA-1, or SHA-256 hash")
+
+    upload_cmd = subparsers.add_parser("upload", help="Upload and scan a file")
+    upload_cmd.add_argument("file", help="Path to file")
+
+    url_cmd = subparsers.add_parser("url", help="Scan a URL")
+    url_cmd.add_argument("url", help="URL to scan")
+
+    args = parser.parse_args()
+
+    load_env()
+    api_key = os.environ.get("VT_API_KEY", "")
+    if not api_key:
+        print("Error: VT_API_KEY environment variable not set", file=sys.stderr)
+        sys.exit(1)
+
+    if args.command == "hash":
+        scan_hash(api_key, args.hash)
+    elif args.command == "upload":
+        upload_file(api_key, args.file)
+    elif args.command == "url":
+        scan_url_cmd(api_key, args.url)
+
+
+if __name__ == "__main__":
+    main()
